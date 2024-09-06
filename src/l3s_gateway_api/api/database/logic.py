@@ -187,31 +187,69 @@ from swagger_client.sse_search_client.models.skill_dto import SkillDto
 from swagger_client.sse_search_client.models.skill_list_dto import SkillListDto
 from swagger_client.sse_search_client.models.search_learning_unit_list_dto import SearchLearningUnitListDto
 from swagger_client.sse_search_client.models.learning_path_list_dto import LearningPathListDto
+from datetime import datetime
+
+
+def write_error_to_file(skill_obj, response, error):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"error_log_{timestamp}.txt"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(f"Skill Object:\n{json.dumps(skill_obj, indent=2)}\n\n")
+        f.write(f"API Response:\n{response}\n\n")
+        f.write(f"Error:\n{str(error)}\n")
+    logger.info(f"Error details written to {filename}")
 
 def skill_content_generator(skill_obj):
     # Convert the dictionary to a string representation
     dict_str = ', '.join([f"{key}: {value}" for key, value in skill_obj.items()])
-    # print(dict_str)
-    # Use the OpenAI API to generate a description
+    
     messages = [
         {"role": "system", "content": "You are a teacher with 30 years of experience. You are designed to output JSON."},
-        {"role": "user", "content": f"Please give me a summary about the skill with the provided information: {dict_str}. I want this explaination of this skill to be in German. The summary must contain the following information: the name of the skill, the description of the skill, the nested skills and parent skills. The output should be in one paragraph. The key must be 'Zusammenfassung'. This summary will be used as input of word embedding for semantic search algorithm. The summary must be in complete sentences with less than 350 tokens."},
+        {"role": "user", "content": f"Please give me a summary about the skill with the provided information: {dict_str}. I want this explanation of this skill to be in German. The summary must contain the following information: the name of the skill, the description of the skill, the nested skills and parent skills. The output should be in one paragraph. The key must be 'Zusammenfassung'. This summary will be used as input of word embedding for semantic search algorithm. The summary must be in complete sentences with less than 350 tokens."},
     ]
-    # print(prompt)
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        response_format={ "type": "json_object" },
-        max_tokens=500,  # Adjust the number of tokens as needed
-    )
-    # print(response)
-    description = response.choices[0].message.content
-    description = description.replace('\n', '').replace('\r', '')
-    if not description.endswith('"}'):
-        description += '"}'
+    
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            response_format={ "type": "json_object" },
+            max_tokens=500,
+        )
+
+        logger.debug(f"API Response: {response}")
+
+        description = response.choices[0].message.content
+
+        # Clean the response
+        description = re.sub(r'[\n\r\t]', '', description)
         
-    summary = json.loads(description)
-    content = list(summary.values())[0]
+        # Try to parse the JSON
+        try:
+            summary = json.loads(description)
+            content = summary.get('Zusammenfassung', '')
+        except json.JSONDecodeError as json_error:
+            logger.warning(f"JSONDecodeError: {json_error}")
+            # If parsing fails, try to extract JSON using regex
+            match = re.search(r'\{.*\}', description)
+            if match:
+                json_str = match.group(0)
+                try:
+                    summary = json.loads(json_str)
+                    content = summary.get('Zusammenfassung', '')
+                except json.JSONDecodeError as nested_json_error:
+                    logger.error(f"Failed to parse extracted JSON: {nested_json_error}")
+                    write_error_to_file(skill_obj, response, nested_json_error)
+                    content = ''
+            else:
+                logger.error("No valid JSON found in the response")
+                write_error_to_file(skill_obj, response, "No valid JSON found")
+                content = ''
+
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        write_error_to_file(skill_obj, "API call failed", e)
+        content = ''
+
     return content
 
 def get_list_of_skills():
@@ -384,7 +422,7 @@ def path_content_generator(path_obj):
     
     # pprint(response)
     description = response.choices[0].message.content
-    description = description.replace('\n', '').replace('\r', '')
+    description = description.replace('\n', '').replace('\r', '').replace('\t','')
     if not description.endswith('"}'):
         description += '"}'
         
@@ -643,31 +681,54 @@ def list_of_task_lite(list_of_tasks):
 from l3s_gateway_api.util import mls_api
 import re
 from bs4 import BeautifulSoup
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 def get_task_content_from_mls(task_id):
-    print(f'Task id: {task_id}')
-    mls_response_json = mls_api.MLSConnection().get_task_by_id(task_id=task_id).json()
-    # pprint(mls_response_json)
+    logger.info(f'Processing task id: {task_id}')
+    try:
+        mls_response_json = mls_api.MLSConnection().get_task_by_id(task_id=task_id).json()
+        logger.debug(f"MLS response for task {task_id}: {mls_response_json}")
+    except Exception as e:
+        logger.error(f"Error fetching task {task_id} from MLS: {str(e)}")
+        return ""
     
-    mls_task_content = ""
-    if mls_response_json['title'] != '':
-        mls_task_content = mls_task_content + f"Title: {mls_response_json['title']}. "
-    if mls_response_json['description'] != '' and mls_response_json['description'] is not None:
-        description_str = re.sub(r'</?p>', '', mls_response_json['description'])
-        mls_task_content = mls_task_content + f'Description: {description_str}'
-    
-    if mls_response_json['taskSteps'] != []:
-        for task_step in mls_response_json['taskSteps']:
+    mls_task_content = []
+
+    # Safely get title and description
+    title = mls_response_json.get('title', '')
+    if title:
+        mls_task_content.append(f"Title: {title}")
+
+    description = mls_response_json.get('description', '')
+    if description:
+        description_str = re.sub(r'</?p>', '', description)
+        mls_task_content.append(f'Description: {description_str}')
+
+    # Process task steps
+    task_steps = mls_response_json.get('taskSteps', [])
+    for task_step in task_steps:
+        try:
             task_step_response = mls_api.MLSConnection().get_task_step_by_id(task_step_id=task_step)
             
-            task_step_title = task_step_response['title']
-            mls_task_content = mls_task_content + f'{task_step_title}. '
-            if (not isinstance(task_step_response['content'][0]['value'], int)):
-                task_step_content = BeautifulSoup(task_step_response['content'][0]['value'], 'html.parser').get_text()
-                task_step_content = task_step_content.replace(u'\xa0', u'')
-                task_step_content = task_step_content.replace(u'\n', u' ')
-                mls_task_content = mls_task_content + f'{task_step_content}. '
-    return mls_task_content
+            task_step_title = task_step_response.get('title', '')
+            if task_step_title:
+                mls_task_content.append(task_step_title)
+
+            content = task_step_response.get('content', [])
+            if isinstance(content, list) and content:
+                content_value = content[0].get('value')
+                if content_value and not isinstance(content_value, int):
+                    task_step_content = BeautifulSoup(content_value, 'html.parser').get_text()
+                    task_step_content = task_step_content.replace(u'\xa0', u' ').replace(u'\n', u' ').strip()
+                    if task_step_content:
+                        mls_task_content.append(task_step_content)
+        except Exception as e:
+            logger.error(f"Error processing task step {task_step} for task {task_id}: {str(e)}")
+
+    return '. '.join(mls_task_content)
 
 
 def db_learning_unit_updater(list_of_tasks):
